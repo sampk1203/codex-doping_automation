@@ -19,6 +19,7 @@ INPUT_PATH = ROOT / "input.yaml"
 
 DEFAULTS = {
     "cif": "cubic-LLZO.cif",
+    "output_dir": "./pipeline_runs",
     "supercell": [1, 1, 2],
     "dopants": [],
     "distance_filters": {
@@ -34,6 +35,7 @@ DEFAULTS = {
     "md_temperatures": [600, 800, 900, 1000, 1200],
     "md_dump_pattern": "dump*{T}*",
     "run_rdf": True,
+    "rdf_temperatures": [900],
     "rdf_pairs": "all",
     "rdf_rmax": 10.0,
     "rdf_dr": 0.05,
@@ -53,6 +55,17 @@ DEFAULTS = {
         "summary": True,
     },
 }
+
+
+DOPANT_COLUMNS = (
+    ("dopant", "Dopant", 90, 10),
+    ("dopant_valency", "Dopant valency", 120, 14),
+    ("host", "Host", 90, 10),
+    ("host_valency", "Host valency", 110, 12),
+    ("count", "Count", 80, 8),
+    ("carrier", "Carrier", 90, 10),
+    ("carrier_valency", "Carrier valency", 120, 14),
+)
 
 
 def parse_scalar(text):
@@ -119,15 +132,18 @@ class App(tk.Tk):
         ttk.Label(frame, text="Input structure CIF").grid(row=0, column=0, sticky="w")
         ttk.Entry(frame, textvariable=self._var("cif"), width=70).grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(frame, text="Browse", command=self.pick_cif).grid(row=0, column=2)
+        ttk.Label(frame, text="Output/run folder").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self._var("output_dir"), width=70).grid(row=1, column=1, sticky="ew", padx=8)
+        ttk.Button(frame, text="Browse", command=self.pick_output_dir).grid(row=1, column=2)
         for i, axis in enumerate("xyz"):
-            ttk.Label(frame, text=f"Supercell {axis} multiplier").grid(row=i + 1, column=0, sticky="w", pady=6)
-            ttk.Spinbox(frame, from_=1, to=20, textvariable=self._var(f"supercell_{axis}"), width=8).grid(row=i + 1, column=1, sticky="w", padx=8)
+            ttk.Label(frame, text=f"Supercell {axis} multiplier").grid(row=i + 2, column=0, sticky="w", pady=6)
+            ttk.Spinbox(frame, from_=1, to=20, textvariable=self._var(f"supercell_{axis}"), width=8).grid(row=i + 2, column=1, sticky="w", padx=8)
         ttk.Label(
             frame,
-            text="Example: CIF = cubic-LLZO.cif, supercell = 1, 1, 2 makes a cell doubled along z. Multipliers are unitless integers.",
+            text="Example: CIF = cubic-LLZO.cif, output/run folder = ./pipeline_runs, supercell = 1, 1, 2. The code stays here; run_*, MD_run_*, logs, RDF folders, and summary.txt are saved in the output folder.",
             foreground="#555",
             wraplength=850,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(16, 0))
         frame.columnconfigure(1, weight=1)
 
     def build_dopants_tab(self):
@@ -139,25 +155,25 @@ class App(tk.Tk):
             foreground="#555",
             wraplength=930,
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 8))
-        columns = ("dopant", "dopant_valency", "host", "host_valency", "count", "carrier", "carrier_valency")
+        columns = tuple(spec[0] for spec in DOPANT_COLUMNS)
         self.dopant_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
-        for col in columns:
-            self.dopant_tree.heading(col, text=col)
-            self.dopant_tree.column(col, width=125, anchor="center")
+        for col, heading, width, _entry_width in DOPANT_COLUMNS:
+            self.dopant_tree.heading(col, text=heading)
+            self.dopant_tree.column(col, width=width, minwidth=width, anchor="center", stretch=False)
         self.dopant_tree.grid(row=1, column=0, columnspan=7, sticky="nsew")
 
         self.dopant_inputs = {}
-        for i, col in enumerate(columns):
+        for i, (col, _heading, _width, entry_width) in enumerate(DOPANT_COLUMNS):
             v = tk.StringVar()
             self.dopant_inputs[col] = v
-            ttk.Entry(frame, textvariable=v, width=14).grid(row=2, column=i, padx=3, pady=8)
+            ttk.Entry(frame, textvariable=v, width=entry_width).grid(row=2, column=i, padx=3, pady=8)
         for col, example in zip(columns, ("Nb", "5", "Zr", "4", "1", "Li", "1")):
             self.dopant_inputs[col].set(example)
         ttk.Button(frame, text="Add row", command=self.add_dopant_from_inputs).grid(row=3, column=0, sticky="w")
         ttk.Button(frame, text="Remove row", command=self.remove_dopant).grid(row=3, column=1, sticky="w")
         ttk.Label(
             frame,
-            text="The boxes above are an editable example, not an active dopant. Press Add row to put it into the list.",
+            text="The boxes above line up with the table columns and are an editable example, not an active dopant. Press Add row to put it into the list.",
             foreground="#555",
         ).grid(row=4, column=0, columnspan=7, sticky="w", pady=(8, 0))
         frame.rowconfigure(1, weight=1)
@@ -217,18 +233,20 @@ class App(tk.Tk):
         frame = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(frame, text="RDF")
         ttk.Checkbutton(frame, text="Run RDF", variable=self._bool("run_rdf")).grid(row=0, column=0, sticky="w")
-        ttk.Label(frame, text="RDF pairs").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self._var("rdf_pairs"), width=40).grid(row=1, column=1, sticky="w")
-        ttk.Label(frame, text="Maximum RDF radius rmax (Angstrom)").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self._var("rdf_rmax"), width=12).grid(row=2, column=1, sticky="w")
-        ttk.Label(frame, text="RDF bin width dr (Angstrom)").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self._var("rdf_dr"), width=12).grid(row=3, column=1, sticky="w")
+        ttk.Label(frame, text="RDF temperatures (K)").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self._var("rdf_temperatures"), width=40).grid(row=1, column=1, sticky="w")
+        ttk.Label(frame, text="RDF element pairs").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self._var("rdf_pairs"), width=40).grid(row=2, column=1, sticky="w")
+        ttk.Label(frame, text="Maximum RDF radius rmax (Angstrom)").grid(row=3, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self._var("rdf_rmax"), width=12).grid(row=3, column=1, sticky="w")
+        ttk.Label(frame, text="RDF bin width dr (Angstrom)").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self._var("rdf_dr"), width=12).grid(row=4, column=1, sticky="w")
         ttk.Label(
             frame,
-            text="RDF temperatures are set in the Relaxation & MD tab. Each temperature is saved separately, for example MD_run_1/rdf_900K/. Pairs format: all or 1-1, 1-2.",
+            text="RDF temperatures must be selected from the MD temperatures. Each temperature is saved separately, for example MD_run_1/rdf_900K/. Pair format for users is element names: all or Li-Li, Li-O. The pipeline maps elements to LAMMPS type numbers after element_list is generated.",
             foreground="#555",
             wraplength=860,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
     def build_analysis_tab(self):
         frame = ttk.Frame(self.notebook, padding=12)
@@ -281,6 +299,14 @@ class App(tk.Tk):
             except ValueError:
                 self.vars["cif"].set(path)
 
+    def pick_output_dir(self):
+        path = filedialog.askdirectory(initialdir=ROOT)
+        if path:
+            try:
+                self.vars["output_dir"].set(str(Path(path).resolve().relative_to(ROOT)))
+            except ValueError:
+                self.vars["output_dir"].set(path)
+
     def add_dopant_from_inputs(self):
         values = [self.dopant_inputs[k].get().strip() for k in self.dopant_inputs]
         if not values[0] or not values[2]:
@@ -303,6 +329,7 @@ class App(tk.Tk):
 
     def apply_config(self, cfg):
         self.vars["cif"].set(cfg.get("cif", DEFAULTS["cif"]))
+        self.vars["output_dir"].set(cfg.get("output_dir", DEFAULTS["output_dir"]))
         for axis, value in zip("xyz", cfg.get("supercell", DEFAULTS["supercell"])):
             self.vars[f"supercell_{axis}"].set(value)
         for row in self.dopant_tree.get_children():
@@ -328,6 +355,7 @@ class App(tk.Tk):
         ]
         self.vars["relax_model"].set(next((m for m in model_labels if m.startswith(relax_value.split()[0] + " ")), model_labels[0]))
         self.vars["md_temperatures"].set(", ".join(map(str, cfg.get("md_temperatures", DEFAULTS["md_temperatures"]))))
+        self.vars["rdf_temperatures"].set(", ".join(map(str, cfg.get("rdf_temperatures", DEFAULTS["rdf_temperatures"]))))
         self.vars["rdf_pairs"].set("all" if cfg.get("rdf_pairs", "all") == "all" else ", ".join(cfg["rdf_pairs"]))
         self.vars["carrier_species"].set("" if cfg.get("carrier_species") is None else cfg.get("carrier_species"))
         for name in ["run_rdf", "run_msd_arrhenius", "run_elastic", "run_trend_plots"]:
@@ -357,6 +385,8 @@ class App(tk.Tk):
             raise ValueError("At least one dopant row is required")
         if len(carriers) != 1:
             raise ValueError("All dopant rows must share the same carrier")
+        if not self.vars["output_dir"].get().strip():
+            raise ValueError("Choose an output/run folder")
 
         filters = {}
         for name, enabled in self.filter_enabled.items():
@@ -364,17 +394,34 @@ class App(tk.Tk):
 
         rdf_pairs_raw = self.vars["rdf_pairs"].get().strip()
         rdf_pairs = "all" if rdf_pairs_raw.lower() == "all" else [x.strip() for x in rdf_pairs_raw.split(",") if x.strip()]
+        md_temperatures = [int(x) for x in parse_list(self.vars["md_temperatures"].get())]
+        rdf_temperatures = [int(x) for x in parse_list(self.vars["rdf_temperatures"].get())]
+        if bool(self.vars["run_rdf"].get()):
+            if not rdf_temperatures:
+                raise ValueError("Enter at least one RDF temperature")
+            invalid = sorted(set(rdf_temperatures) - set(md_temperatures))
+            if invalid:
+                raise ValueError(f"RDF temperatures must be chosen from MD temperatures. Invalid: {invalid}")
+            if rdf_pairs != "all":
+                bad_pairs = [
+                    p for p in rdf_pairs
+                    if len(p.split("-")) != 2 or not all(part.isalpha() for part in p.split("-"))
+                ]
+                if bad_pairs:
+                    raise ValueError(f"RDF pairs must use element names like Li-Li or Li-O, not type numbers. Invalid: {bad_pairs}")
 
         return {
             "cif": self.vars["cif"].get().strip(),
+            "output_dir": self.vars["output_dir"].get().strip(),
             "supercell": [int(self.vars[f"supercell_{a}"].get()) for a in "xyz"],
             "dopants": dopants,
             "distance_filters": filters,
             "max_files_per_folder": int(self.vars["max_files_per_folder"].get()),
             "relax_model": int(str(self.vars["relax_model"].get()).split()[0]),
-            "md_temperatures": [int(x) for x in parse_list(self.vars["md_temperatures"].get())],
+            "md_temperatures": md_temperatures,
             "md_dump_pattern": self.vars["md_dump_pattern"].get().strip(),
             "run_rdf": bool(self.vars["run_rdf"].get()),
+            "rdf_temperatures": rdf_temperatures,
             "rdf_pairs": rdf_pairs,
             "rdf_rmax": float(self.vars["rdf_rmax"].get()),
             "rdf_dr": float(self.vars["rdf_dr"].get()),

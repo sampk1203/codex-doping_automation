@@ -7,6 +7,7 @@
 # ============================================================
 
 cif: "cubic-LLZO.cif"
+output_dir: "./pipeline_runs"
 supercell: [1, 1, 2]
 
 # Add dopants in the GUI, or uncomment/edit the example below.
@@ -36,7 +37,8 @@ md_temperatures: [600, 800, 900, 1000, 1200]  # K
 md_dump_pattern: "dump*{T}*"
 
 run_rdf: true
-rdf_pairs: "all"      # "all" or list like ["1-1", "1-2"]
+rdf_temperatures: [900]  # K, must be selected from md_temperatures
+rdf_pairs: "all"      # "all" or element pairs like ["Li-Li", "Li-O"]
 rdf_rmax: 10.0        # Angstrom
 rdf_dr: 0.05          # Angstrom
 

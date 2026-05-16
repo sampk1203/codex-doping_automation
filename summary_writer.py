@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import csv
 import re
+import argparse
 from pathlib import Path
 
 
@@ -79,9 +80,11 @@ def parse_rdf_log(path):
     return rows
 
 
-def write_summary():
-    md_dirs = sorted(ROOT.glob("MD_run_*"), key=lambda p: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", p.name)])
-    with OUT.open("w", encoding="utf-8", newline="") as fh:
+def write_summary(root):
+    root = Path(root).resolve()
+    out = root / "summary.txt"
+    md_dirs = sorted(root.glob("MD_run_*"), key=lambda p: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", p.name)])
+    with out.open("w", encoding="utf-8", newline="") as fh:
         fh.write("LLZO Pipeline Summary\n")
         fh.write("=====================\n\n")
 
@@ -123,8 +126,11 @@ def write_summary():
             for temp, pair, cn, r_min in parse_rdf_log(md / "rdf_process.log"):
                 writer.writerow([md.name, temp, pair, cn, r_min])
 
-    print(f"[INFO] Summary written to {OUT}")
+    print(f"[INFO] Summary written to {out}")
 
 
 if __name__ == "__main__":
-    write_summary()
+    parser = argparse.ArgumentParser(description="Collect LLZO pipeline outputs into summary.txt.")
+    parser.add_argument("--root", default=str(ROOT), help="Folder containing MD_run_* outputs")
+    args = parser.parse_args()
+    write_summary(args.root)
