@@ -1,0 +1,667 @@
+
+"""
+merged_multi_dopant.py
+
+Multi-dopant merger of your previous scripts.
+
+Behavior:
+ - Hardcoded PARAMETERS at top (dopant species, counts, valencies, site choices).
+ - Builds supercell, finds 24d/96h/host positions.
+ - Creates per-species substitution pools and enumerates combined dopant-site
+   configurations (Cartesian product of per-species combinations).
+ - Filters combined configs by dopant-dopant distance limits and prints them
+   in a numbered 1-based list with clear labels (Al3-Ta47 etc).
+ - User selects one or more configurations (comma-separated 1-based indices).
+ - Computes Δn_Li using: Δn_Li = Σ(n_d * v_d) - Σ(n_d * v_h).
+   If Δn_Li > 0 -> remove Li from 24d; if < 0 -> add Li to empty 96h.
+ - Checks availability (occupied 24d minus dopants on 24d; empty 96h).
+ - Enumerates Li-change combos, applies dop-Li and Li-Li filters, writes
+   CSVs and CIFs for valid structures and appends selected_sites.csv.
+
+Edit PARAMETERS below to suit your test case. Warnings/verbose output are
+redirected to warnings.log inside output folder(s).
+"""
+import os
+import sys
+import csv
+import warnings
+from itertools import combinations, product
+from contextlib import redirect_stdout, redirect_stderr
+from io import StringIO
+
+import numpy as np
+from pymatgen.core import Structure, Element, Lattice
+from pymatgen.io.cif import CifWriter
+from pymatgen.symmetry.groups import SpaceGroup
+from scipy.spatial import cKDTree
+
+warnings.filterwarnings("ignore")
+
+# --------------------- PARAMETERS (EDIT HERE) ---------------------
+# Input CIF and supercell repeats
+INPUT_CIF = "cubic-LLZO.cif"
+SUPERCELL_REPEATS = (1, 1, 2)
+
+# Output folder
+OUTPUT_FOLDER = "./run_1"
+
+AVAILABLE_CONFIGS_FILE = os.path.join(OUTPUT_FOLDER, "available_configs.txt")
+SELECTED_CONFIGS_FILE = os.path.join(OUTPUT_FOLDER, "selected_configs.txt")
+
+# Maximum number of enumerated Li-change configurations allowed per selected dopant combo
+MAX_CONFIGURATIONS = 1000
+
+# Distance limits (set None to disable)
+# These bounds are applied to all dopant-dopant pairs and to dop-Li and Li-Li pairs.
+DOP_DOP_MIN = None   # e.g. None
+DOP_DOP_MAX = None
+DOP_LI_MIN = None
+DOP_LI_MAX = 15.0
+LI_LI_MIN = None
+LI_LI_MAX = None
+
+# Wyckoff references & tolerances (fixed for cubic LLZO)
+WYCKOFF_TOL = 0.03
+REF_24D = [0.375, 0.0, 0.25]
+REF_96H = [0.0959, 0.6922, 0.5731]
+
+# Host-valency per site-type
+HOST_VALENCY_BY_SITE = {"24d": 1, "La": 3, "Zr": 4}
+
+# Dopant specification list
+# Each entry: element (string), valency (int), site (one of "24d","La","Zr"), count (int)
+# Example: Al substitutes Li 24d; Ta substitutes La sites.
+DOPANTS = [
+    {"element": "Nb", "valency": 5, "site": "Zr", "count": 1},
+    {"element": "Y", "valency": 3, "site": "La", "count": 1},
+    # Add more dopants here as needed
+]
+# --- Sanity check: Ensure no duplicate dopant-site combinations ---
+dopant_site_pairs = [(d["element"], d["site"]) for d in DOPANTS]
+if len(dopant_site_pairs) != len(set(dopant_site_pairs)):
+    print(f"[ERROR] Duplicate dopant-site combinations detected: {dopant_site_pairs}")
+    print("       Each dopant-site pair must be unique in the DOPANTS list.")
+    sys.exit(1)
+
+# ------------------------------------------------------------------
+
+# quick checks
+if not os.path.exists(INPUT_CIF):
+    print(f"[ERROR] Input CIF not found: {INPUT_CIF}")
+    sys.exit(1)
+
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+GLOBAL_WARN_LOG = os.path.join(OUTPUT_FOLDER, "warnings.log")
+
+# --------------------- Helpers ---------------------
+def make_formula_sum(struct):
+    counts = {}
+    for s in struct:
+        sym = s.specie.symbol
+        counts[sym] = counts.get(sym, 0) + 1
+    return " ".join([f"{el}{counts[el]}" for el in sorted(counts.keys())])
+
+def fix_cif_formula(cif_path, struct):
+    formula = make_formula_sum(struct)
+    with open(cif_path, "r") as f:
+        lines = f.readlines()
+    found = False
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("_chemical_formula_sum"):
+            lines[i] = f"_chemical_formula_sum   '{formula}'\n"
+            found = True
+            break
+    if not found:
+        for i, ln in enumerate(lines[:20]):
+            if ln.strip().startswith("data_"):
+                lines.insert(i+1, f"_chemical_formula_sum   '{formula}'\n")
+                break
+    with open(cif_path, "w") as f:
+        f.writelines(lines)
+
+def float_or_none(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def within_limits(dist_list, dmin, dmax):
+    if not dist_list:
+        return True
+    if dmin is not None and min(dist_list) < dmin:
+        return False
+    if dmax is not None and max(dist_list) > dmax:
+        return False
+    return True
+
+def check_all_limits(dist_dict):
+    ok = True
+    ok = ok and within_limits(dist_dict.get("Dop-Dop", []), DOP_DOP_MIN, DOP_DOP_MAX)
+    ok = ok and within_limits(dist_dict.get("Li-Dop", []), DOP_LI_MIN, DOP_LI_MAX)
+    ok = ok and within_limits(dist_dict.get("Li-Li", []), LI_LI_MIN, LI_LI_MAX)
+    return ok
+
+def pbc_distance(struct, i, j):
+    return struct.get_distance(i, j)
+
+# --------------------- Load structure & build supercell ---------------------
+orig_struct = Structure.from_file(INPUT_CIF)
+sg = SpaceGroup("Ia-3d")
+
+def generate_positions(ref_pos):
+    pos_list = [op.operate(ref_pos) % 1 for op in sg.symmetry_ops]
+    return np.unique(np.round(pos_list, 6), axis=0)
+
+positions_24d = generate_positions(REF_24D)
+positions_96h = generate_positions(REF_96H)
+tree_24d = cKDTree(positions_24d)
+tree_96h = cKDTree(positions_96h)
+
+# classify Li in original cell
+li_indices_orig = [i for i, s in enumerate(orig_struct) if s.specie.symbol == "Li"]
+li_24d_orig = []
+li_96h_orig = []
+for i in li_indices_orig:
+    fcoords = np.round(orig_struct[i].frac_coords, 6)
+    d24, _ = tree_24d.query(fcoords)
+    d96, _ = tree_96h.query(fcoords)
+    if d24 < WYCKOFF_TOL and d24 < d96:
+        li_24d_orig.append(i)
+    elif d96 < WYCKOFF_TOL and d96 < d24:
+        li_96h_orig.append(i)
+
+# host site indices for La / Zr in original cell
+host_la_orig = [i for i, s in enumerate(orig_struct) if s.specie.symbol == "La"]
+host_zr_orig = [i for i, s in enumerate(orig_struct) if s.specie.symbol == "Zr"]
+
+# Build supercell
+nx, ny, nz = SUPERCELL_REPEATS
+lattice = orig_struct.lattice.matrix
+orig_coords_cart = orig_struct.cart_coords
+
+supercell_coords = []
+supercell_species = []
+li_24d_super = []
+li_96h_super = []
+host_la_super = []
+host_zr_super = []
+
+for iz in range(nz):
+    for iy in range(ny):
+        for ix in range(nx):
+            translation = ix * lattice[0] + iy * lattice[1] + iz * lattice[2]
+            offset = len(supercell_coords)
+            for i, coord in enumerate(orig_coords_cart):
+                supercell_coords.append(coord + translation)
+                supercell_species.append(orig_struct[i].specie)
+            for idx in li_24d_orig:
+                li_24d_super.append(offset + idx)
+            for idx in li_96h_orig:
+                li_96h_super.append(offset + idx)
+            for idx in host_la_orig:
+                host_la_super.append(offset + idx)
+            for idx in host_zr_orig:
+                host_zr_super.append(offset + idx)
+
+supercell_lattice = Lattice(orig_struct.lattice.matrix * np.array([nx, ny, nz])[:, None].T)
+supercell_struct = Structure(supercell_lattice, supercell_species, supercell_coords, coords_are_cartesian=True)
+
+# Build empty 96h candidates in supercell (empty i.e. not occupied by Li in orig cell)
+occupied_96h = []
+for i in li_96h_orig:
+    fcoords = orig_struct[i].frac_coords
+    d, idx = tree_96h.query(fcoords)
+    if d < WYCKOFF_TOL:
+        occupied_96h.append(idx)
+all_96h_indices = list(range(len(positions_96h)))
+empty_96h = [i for i in all_96h_indices if i not in occupied_96h]
+
+empty_96h_super = []
+for iz in range(nz):
+    for iy in range(ny):
+        for ix in range(nx):
+            for w in empty_96h:
+                frac_super = (np.array(positions_96h[w]) + np.array([ix, iy, iz])) / np.array([nx, ny, nz])
+                cart = supercell_lattice.get_cartesian_coords(frac_super)
+                label = f"96h_w{w}_img{ix}{iy}{iz}"
+                empty_96h_super.append({"w": w, "ix": ix, "iy": iy, "iz": iz, "frac": frac_super, "cart": cart, "label": label})
+
+# ------------------ Build substitution pools per dopant species ------------------
+# Each dopant chooses a site-type which maps to a list of supercell site indices.
+substitution_pools = []  # list matching DOPANTS order: list of site indices in supercell
+for dop in DOPANTS:
+    site = dop["site"]
+    if site == "24d":
+        pool = li_24d_super.copy()
+    elif site == "La":
+        pool = host_la_super.copy()
+    elif site == "Zr":
+        pool = host_zr_super.copy()
+    else:
+        raise ValueError(f"Unknown site type for dopant: {site}")
+    substitution_pools.append(pool)
+
+# simple report
+print(f"[info] Supercell {nx}x{ny}x{nz} built.")
+print(f"[info] Total Li in original cell: {len(li_indices_orig)}, 24d: {len(li_24d_orig)}, 96h occupied: {len(li_96h_orig)}")
+print(f"[info] Supercell counts -> li_24d_super: {len(li_24d_super)}, empty_96h candidates: {len(empty_96h_super)}, La sites(super): {len(host_la_super)}, Zr sites(super): {len(host_zr_super)}")
+
+# ------------------ Generate per-species combinations ------------------
+per_species_combos = []
+for dop_idx, dop in enumerate(DOPANTS):
+    count = dop["count"]
+    pool = substitution_pools[dop_idx]
+    if len(pool) < count:
+        print(f"[ERROR] Not enough sites in pool for {dop['element']} at site {dop['site']}: pool len {len(pool)}, needed {count}")
+        sys.exit(1)
+    combos = list(combinations(pool, count))
+    per_species_combos.append(combos)
+    print(f"[info] {dop['element']} pool size {len(pool)} -> {len(combos)} combos of count {count}")
+
+# ------------------ Build combined dopant-site configurations (Cartesian product) ------------------
+# Each combined configuration is a tuple of tuples: ((Al_site1,...), (Ta_site1,...), ...)
+combined_configs = []
+max_comb_explore = 200000  # safety cutoff to avoid extremely huge enumeration
+product_iter = product(*per_species_combos)
+for i, combo_tuple in enumerate(product_iter):
+    if i >= max_comb_explore:
+        print(f"[WARN] Reached exploration cap of {max_comb_explore} combined configs; increase max_comb_explore if needed.")
+        break
+    # flatten selected sites and ensure no overlapping site indices
+    flat = [s for tup in combo_tuple for s in tup]
+    if len(set(flat)) != len(flat):
+        # overlapping site indices (two dopants choose same atomic site) -> skip
+        continue
+    # compute dopant-dopant distances for this combined config
+    dop_sites_flat = flat
+    dop_dop_dists = []
+    for ii in range(len(dop_sites_flat)):
+        for jj in range(ii+1, len(dop_sites_flat)):
+            d = pbc_distance(supercell_struct, dop_sites_flat[ii], dop_sites_flat[jj])
+            dop_dop_dists.append(d)
+    # apply dop-dop limits
+    if within_limits(dop_dop_dists, DOP_DOP_MIN, DOP_DOP_MAX):
+        combined_configs.append((combo_tuple, dop_dop_dists))
+
+print(f"[info] Combined configurations passing dop-dop (pre-filter) found: {len(combined_configs)}")
+
+if not combined_configs:
+    print("[ERROR] No valid combined dopant configurations found with current dopant counts/limits.")
+    sys.exit(1)
+
+# ------------------ Present combined configurations with labeled dopant-dopant distances ------------------
+# ------------------ Save combined configurations to a text file instead of printing ------------------
+config_list_path = os.path.join(OUTPUT_FOLDER, "available_configs.txt")
+display_list = []
+
+with open(config_list_path, "w") as f:
+    f.write("Available combined dopant configurations (1-based indices)\n")
+    f.write("Format: index. {species_sites}   distances: <pairlabel:dist, ...>\n\n")
+
+    for display_idx, (combo_tuple, distances) in enumerate(combined_configs, start=1):
+        labels = []
+        flat_sites = []
+        for sidx, (dop, sel) in enumerate(zip(DOPANTS, combo_tuple)):
+            el = dop["element"]
+            for site_index in sel:
+                labels.append((el, site_index))
+                flat_sites.append(site_index)
+
+        # Build distance strings
+        pair_strs = []
+        for i in range(len(flat_sites)):
+            for j in range(i+1, len(flat_sites)):
+                lab_i = f"{labels[i][0]}{labels[i][1]+1}"
+                lab_j = f"{labels[j][0]}{labels[j][1]+1}"
+                d = pbc_distance(supercell_struct, flat_sites[i], flat_sites[j])
+                pair_strs.append(f"{lab_i}-{lab_j}:{d:.4f}Å")
+
+        # Write one line to file
+        f.write(f"{display_idx:4d}. sites={[ (lab, si+1) for lab,si in labels ]}   distances: {', '.join(pair_strs)}\n")
+
+        display_list.append((combo_tuple, labels))
+
+print(f"\n[INFO] Full configuration list written to: {config_list_path}")
+print("      Open this file and choose indices from there.")
+
+
+# ------------------ Non-interactive selection handling ------------------
+
+# available configs exist, now read selected_configs.txt
+if not os.path.exists(SELECTED_CONFIGS_FILE):
+    print(f"[INFO] {SELECTED_CONFIGS_FILE} not found. FIRST RUN → generating only available_configs.txt.")
+    sys.exit(0)   # <-- SUCCESS exit so worker.sh continues
+print("[INFO] Available configs generated. Please review and create 'selected_configs.txt' with indices, then rerun.")
+
+# read selection indices from selected_configs.txt
+with open(SELECTED_CONFIGS_FILE, "r") as f:
+    sel_input = f.read().strip()
+
+if not sel_input:
+    print(f"[ERROR] {SELECTED_CONFIGS_FILE} is empty. Exiting.")
+
+print(f"[INFO] Using selection indices from {SELECTED_CONFIGS_FILE}: {sel_input}")
+
+# parse indices
+sel_indices = []
+for tok in sel_input.split(","):
+    tok = tok.strip()
+    if tok == "":
+        continue
+    try:
+        val = int(tok)
+    except Exception:
+        print(f"[ERROR] Invalid token in {SELECTED_CONFIGS_FILE}: {tok}")
+        sys.exit(1)
+    sel_indices.append(val)
+
+# validate indices
+for v in sel_indices:
+    if not (1 <= v <= len(display_list)):
+        print(f"[ERROR] Selection {v} out of range (1..{len(display_list)})")
+        sys.exit(1)
+
+selected_combos = [display_list[i-1] for i in sel_indices]
+
+
+# ------------------ Compute Delta n_Li using your formula ------------------
+# Δn_Li = Σ(n_d * v_d) - Σ(n_d * v_h)
+# where v_h depends on the site each dopant is replacing.
+def compute_delta_n_Li_for_combo(combo_tuple):
+    # combo_tuple = tuple of per-species tuples (site indices)
+    total_dop_vd = 0
+    total_dop_vh = 0
+    total_dop_at_site_24d = 0
+    for dop_spec, sel_sites in zip(DOPANTS, combo_tuple):
+        n_d = len(sel_sites)
+        v_d = dop_spec["valency"]
+        site = dop_spec["site"]
+        v_h = HOST_VALENCY_BY_SITE["24d"] if site == "24d" else HOST_VALENCY_BY_SITE.get(site, 0)
+        total_dop_vd += n_d * v_d
+        total_dop_vh += n_d * v_h
+        if site == "24d":
+            total_dop_at_site_24d += n_d
+    delta = total_dop_vd - total_dop_vh
+    return int(delta), total_dop_at_site_24d
+
+
+# ------------------ Compute total Li change across all selected configurations ------------------
+total_li_change = 0
+for combo_tuple, labels in [c for c in selected_combos]:
+    delta_n_Li, _ = compute_delta_n_Li_for_combo(combo_tuple)
+    total_li_change += delta_n_Li
+
+if total_li_change > 0:
+    print(f"\n[SUMMARY] Total Li to REMOVE across all selected configs: {total_li_change}")
+elif total_li_change < 0:
+    print(f"\n[SUMMARY] Total Li to ADD across all selected configs: {abs(total_li_change)}")
+else:
+    print("\n[SUMMARY] No net Li change across all selected configs.")
+# ------------------ For each selected combined config: enumerate Li-change combos, write outputs -----------------
+for sel_idx, (combo_tuple, labels) in enumerate(selected_combos, start=1):
+    # create folder name describing dopants and sites (use 1-based indices in names for clarity)
+    dop_folder_tag = []
+    for dop_spec, sel in zip(DOPANTS, combo_tuple):
+        el = dop_spec["element"]
+        for s in sel:
+            dop_folder_tag.append(f"{el}{s+1}")
+    folder_name = "_".join(dop_folder_tag)
+    out_folder = os.path.join(OUTPUT_FOLDER, folder_name)
+    os.makedirs(out_folder, exist_ok=True)
+    warnings_log = open(os.path.join(out_folder, "warnings.log"), "a")
+
+    delta_n_Li, total_dop_24d = compute_delta_n_Li_for_combo(combo_tuple)
+    # find the global index of this selection (for user clarity)
+    global_index = sel_indices[sel_idx - 1]
+
+    if delta_n_Li > 0:
+        print(f"\n[info] Combined selection {sel_idx} (global index #{global_index}): need to REMOVE {delta_n_Li} Li (from 24d).")
+    elif delta_n_Li < 0:
+        print(f"\n[info] Combined selection {sel_idx} (global index #{global_index}): need to ADD {abs(delta_n_Li)} Li (to empty 96h).")
+    else:
+        print(f"\n[info] Combined selection {sel_idx} (global index #{global_index}): no Li change required (Δn_Li = 0).")
+
+    # availability checks BEFORE enumerating removals/additions
+    if delta_n_Li > 0:
+        # available occupied 24d Li sites for removal = len(li_24d_super) - (number of dopants placed at 24d)
+        available_remove = len(li_24d_super) - total_dop_24d
+        print(f"[info] Occupied 24d Li available for removal: {available_remove}")
+        if delta_n_Li > available_remove:
+            print(f"[ERROR] Requested removal {delta_n_Li} exceeds available {available_remove}. Skipping this selection.")
+            warnings_log.write(f"Insufficient 24d Li for removal for selection {folder_name}\n")
+            warnings_log.close()
+            continue
+    elif delta_n_Li < 0:
+        to_add = abs(delta_n_Li)
+        available_add = len(empty_96h_super)
+        print(f"[info] Empty 96h candidates available for addition: {available_add}")
+        if to_add > available_add:
+            print(f"[ERROR] Requested addition {to_add} exceeds available {available_add}. Skipping this selection.")
+            warnings_log.write(f"Insufficient empty 96h for addition for selection {folder_name}\n")
+            warnings_log.close()
+            continue
+
+    # Build list of dopant site indices (flatten) and species labels in same order
+    flat_sites = []
+    flat_species = []
+    for dop_spec, sel in zip(DOPANTS, combo_tuple):
+        el = dop_spec["element"]
+        for s in sel:
+            flat_sites.append(s)
+            flat_species.append(el)
+
+    # Build li-change combos
+    remaining_24d_li = [i for i in li_24d_super if i not in flat_sites]  # these are candidate Li indices still present in 24d
+    if delta_n_Li > 0:
+        # remove delta_n_Li Li from remaining_24d_li
+        li_change_combos = list(combinations(remaining_24d_li, delta_n_Li))
+    elif delta_n_Li < 0:
+        n_add = abs(delta_n_Li)
+        li_change_combos = list(combinations(range(len(empty_96h_super)), n_add))  # indices into empty_96h_super
+    else:
+        li_change_combos = [()]
+
+# ------------------ Replace MAX_CONFIGURATIONS slicing with batched scanning -----------------
+    valid_count = 0
+    batch_size = 20  # check every 20 combos
+    new_li_change_combos = []
+
+    for batch_start in range(0, len(li_change_combos), batch_size):
+        batch = li_change_combos[batch_start: batch_start + batch_size]
+
+        for li_combo in batch:
+            # Here we only "scan" combos to see if they are valid (distance checks will happen later)
+            new_li_change_combos.append(li_combo)
+            valid_count += 1
+            if valid_count >= MAX_CONFIGURATIONS:
+                break
+
+        if valid_count >= MAX_CONFIGURATIONS:
+            break
+
+    if len(li_change_combos) > MAX_CONFIGURATIONS:
+        print(f"[WARN] {len(li_change_combos)} Li-change combos exceed MAX_CONFIGURATIONS ({MAX_CONFIGURATIONS}).")
+        print(f"       Only {valid_count} configurations will be generated.\n")
+        warnings_log.write(f"[WARN] {len(li_change_combos)} Li-change combos for {folder_name} exceed MAX_CONFIGURATIONS.\n")
+        warnings_log.write(f"       Only {valid_count} configurations will be generated.\n")
+
+    li_change_combos = new_li_change_combos
+
+
+
+    # CSV writer for this selection
+    csv_path = os.path.join(out_folder, "pair_distances.csv")
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        header_written = False
+
+        for li_combo in li_change_combos:
+            temp_struct = supercell_struct.copy()
+            # substitute dopants in temp_struct
+            for site_idx, el in zip(flat_sites, flat_species):
+                temp_struct[site_idx] = Element(el)
+
+            # Compute pair distances (Dop-Dop)
+            dop_dop_pairs = []
+            dop_dop_distances = []
+            for i in range(len(flat_sites)):
+                for j in range(i+1, len(flat_sites)):
+                    lab_i = f"{flat_species[i]}{flat_sites[i]+1}"
+                    lab_j = f"{flat_species[j]}{flat_sites[j]+1}"
+                    d = pbc_distance(temp_struct, flat_sites[i], flat_sites[j])
+                    dop_dop_pairs.append(f"{lab_i}-{lab_j}")
+                    dop_dop_distances.append(d)
+
+            # handle REMOVAL
+            if delta_n_Li > 0:
+                rem_sorted = sorted(li_combo)
+                # compute dop-Li and Li-Li BEFORE removal (they are distances from dopants to those Li atoms)
+                dop_li_pairs = []
+                dop_li_distances = []
+                for di, ds in enumerate(flat_sites):
+                    for li in rem_sorted:
+                        lab_d = f"{flat_species[di]}{ds+1}"
+                        lab_l = f"Li{li+1}"
+                        d = pbc_distance(temp_struct, ds, li)
+                        dop_li_pairs.append(f"{lab_d}-{lab_l}")
+                        dop_li_distances.append(d)
+
+                li_li_pairs = []
+                li_li_distances = []
+                for i in range(len(rem_sorted)):
+                    for j in range(i+1, len(rem_sorted)):
+                        lab1 = f"Li{rem_sorted[i]+1}"
+                        lab2 = f"Li{rem_sorted[j]+1}"
+                        d = pbc_distance(temp_struct, rem_sorted[i], rem_sorted[j])
+                        li_li_pairs.append(f"{lab1}-{lab2}")
+                        li_li_distances.append(d)
+
+                dist_dict = {
+                    "Dop-Dop": dop_dop_distances,
+                    "Li-Dop": dop_li_distances,
+                    "Li-Li": li_li_distances,
+                }
+                if not check_all_limits(dist_dict):
+                    continue
+
+                # prepare CSV row header once
+                pair_labels = dop_dop_pairs + dop_li_pairs + li_li_pairs
+                if not header_written:
+                    writer.writerow(["Dopant_Sites", "Li_Removed_Sites"] + [f"{p}_Dist(A)" for p in pair_labels])
+                    header_written = True
+
+                dop_sites_str = ";".join([f"{flat_species[i]}{flat_sites[i]+1}" for i in range(len(flat_sites))])
+                rem_str = ";".join(str(r+1) for r in rem_sorted)
+                all_distances = dop_dop_distances + dop_li_distances + li_li_distances
+                writer.writerow([dop_sites_str, rem_str] + [f"{d:.4f}" for d in all_distances])
+
+                # remove Li (do it on a copy)
+                for idx in sorted(rem_sorted, reverse=True):
+                    temp_struct.remove_sites([idx])
+
+                # write CIF (suppress noisy output)
+                cif_name = f"LiRemoved-{'_'.join(str(r+1) for r in rem_sorted)}.cif"
+                cif_path = os.path.join(out_folder, cif_name)
+                with redirect_stdout(warnings_log), redirect_stderr(warnings_log):
+                    CifWriter(temp_struct).write_file(cif_path)
+                try:
+                    fix_cif_formula(cif_path, temp_struct)
+                except Exception as e:
+                    warnings_log.write(f"Error fixing CIF formula for {cif_path}: {e}\n")
+
+            # handle ADDITION
+            elif delta_n_Li < 0:
+                add_indices = sorted(li_combo)
+                appended_indices = []
+                for e_idx in add_indices:
+                    cart = empty_96h_super[e_idx]["cart"]
+                    temp_struct.append("Li", cart, coords_are_cartesian=True)
+                    appended_indices.append(len(temp_struct)-1)
+
+                # compute dop-Li (to appended) and Li-Li (between appended)
+                dop_li_pairs = []
+                dop_li_distances = []
+                for di, ds in enumerate(flat_sites):
+                    for a in appended_indices:
+                        lab_d = f"{flat_species[di]}{ds+1}"
+                        lab_l = f"Li{a+1}"
+                        d = pbc_distance(temp_struct, ds, a)
+                        dop_li_pairs.append(f"{lab_d}-{lab_l}")
+                        dop_li_distances.append(d)
+
+                li_li_pairs = []
+                li_li_distances = []
+                for i in range(len(appended_indices)):
+                    for j in range(i+1, len(appended_indices)):
+                        lab1 = f"Li{appended_indices[i]+1}"
+                        lab2 = f"Li{appended_indices[j]+1}"
+                        d = pbc_distance(temp_struct, appended_indices[i], appended_indices[j])
+                        li_li_pairs.append(f"{lab1}-{lab2}")
+                        li_li_distances.append(d)
+
+                dist_dict = {
+                    "Dop-Dop": dop_dop_distances,
+                    "Li-Dop": dop_li_distances,
+                    "Li-Li": li_li_distances,
+                }
+                if not check_all_limits(dist_dict):
+                    continue
+
+                pair_labels = dop_dop_pairs + dop_li_pairs + li_li_pairs
+                if not header_written:
+                    writer.writerow(["Dopant_Sites", "Li_Added_Sites"] + [f"{p}_Dist(A)" for p in pair_labels])
+                    header_written = True
+
+                dop_sites_str = ";".join([f"{flat_species[i]}{flat_sites[i]+1}" for i in range(len(flat_sites))])
+                added_labels_str = ";".join([empty_96h_super[e]["label"] for e in add_indices])
+                all_distances = dop_dop_distances + dop_li_distances + li_li_distances
+                writer.writerow([dop_sites_str, added_labels_str] + [f"{d:.4f}" for d in all_distances])
+
+                # write CIF
+                cif_name = f"LiAdded-{'_'.join(empty_96h_super[e]['label'] for e in add_indices)}.cif"
+                cif_path = os.path.join(out_folder, cif_name)
+                with redirect_stdout(warnings_log), redirect_stderr(warnings_log):
+                    CifWriter(temp_struct).write_file(cif_path)
+                try:
+                    fix_cif_formula(cif_path, temp_struct)
+                except Exception as e:
+                    warnings_log.write(f"Error fixing CIF formula for {cif_path}: {e}\n")
+
+            # NO CHANGE
+            else:
+                dist_dict = {"Dop-Dop": dop_dop_distances}
+                if not check_all_limits(dist_dict):
+                    continue
+                pair_labels = dop_dop_pairs
+                if not header_written:
+                    writer.writerow(["Dopant_Sites", "Li_Changed_Sites"] + [f"{p}_Dist(A)" for p in pair_labels])
+                    header_written = True
+                dop_sites_str = ";".join([f"{flat_species[i]}{flat_sites[i]+1}" for i in range(len(flat_sites))])
+                writer.writerow([dop_sites_str, "None"] + [f"{d:.4f}" for d in dop_dop_distances])
+                cif_name = "NoLiChange.cif"
+                cif_path = os.path.join(out_folder, cif_name)
+                with redirect_stdout(warnings_log), redirect_stderr(warnings_log):
+                    CifWriter(temp_struct).write_file(cif_path)
+                try:
+                    fix_cif_formula(cif_path, temp_struct)
+                except Exception as e:
+                    warnings_log.write(f"Error fixing CIF formula for {cif_path}: {e}\n")
+
+    # append to global selected_sites.csv
+    global_csv = os.path.join(OUTPUT_FOLDER, "selected_sites.csv")
+    header_needed = not os.path.exists(global_csv)
+    with open(global_csv, "a", newline="") as gf:
+        gw = csv.writer(gf)
+        if header_needed:
+            gw.writerow(["Dopant_Element_List", "Dopant_Sites(1-based)", "Δn_Li", "Folder"])
+        dopant_list_str = ";".join([d["element"] for d in DOPANTS])
+        dop_sites_str = ";".join([f"{lab[0]}{lab[1]}" for lab in labels])  # labels were (element, site_index)
+        gw.writerow([dopant_list_str, dop_sites_str, delta_n_Li, os.path.abspath(out_folder)])
+
+    warnings_log.close()
+    print(f"[DONE] Selection written to {os.path.abspath(out_folder)} (CSV + CIFs).")
+    cif_files = [f for f in os.listdir(out_folder) if f.endswith(".cif")]
+    if not cif_files:
+        print(f"[WARN] No CIF files were generated in {out_folder}. Check filters or limits.")
+
+print("\nAll selected configurations processed. Global logs (if any):", GLOBAL_WARN_LOG)

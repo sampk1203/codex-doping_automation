@@ -1,0 +1,80 @@
+# =====================================
+#       MULTI-TEMPERATURE LOOP
+# =====================================
+
+# ---------- USER INPUT ----------
+variable Prefix   string lmp
+#/media/sampk/350GB/1_qpivolta/1_Doped_cLLZO/2_Al_Ta@24d_Zr/1Al_2Ta/Ta81_Ta82_Al1/LiRemoved-2_4_5_9.cif
+# your datafile atom-type order
+variable ElemList string "Li La Zr Ta Al O"
+
+# Temperatures to loop
+variable TempList index 800 900 1000 1100 1200
+
+# Fixed simulation parameters
+variable dt      equal 0.001
+variable t_run   equal 200000
+
+# =====================================
+label loop_start
+variable T equal ${TempList}
+
+print "===================================="
+print " Running ${Prefix} at T = ${T} K"
+print "===================================="
+
+# ---------- RESET EVERYTHING ----------
+clear
+log log_${Prefix}_${T}K.lammps
+
+# ---------- SYSTEM SETUP ----------
+units       metal
+atom_style  charge
+boundary    p p p
+read_data   ${Prefix}.data
+
+neighbor    2.0 bin
+neigh_modify delay 0 every 1 check yes
+
+# Li atoms = type 1  (confirm)
+group       type1 type 1
+
+# ---------- FORCE FIELD ----------
+pair_style      gnnp/gpu gnnp_driver.py
+pair_coeff      * * orb orb-v3-conservative-inf-omat ${ElemList}
+
+# ---------- OUTPUT ----------
+thermo      10
+thermo_style custom step temp pe ke etotal press
+
+variable DumpFile    string dump_${Prefix}_${T}K.lammpstrj
+variable MSDFile     string msd_ngp_Li_${Prefix}_${T}K.txt
+variable RestartFile string ${Prefix}_${T}K.restart
+
+dump 1 all custom 100 ${DumpFile} id type xu yu zu
+
+# ---------- COMPUTES ----------
+compute     msd_type1 type1 msd/nongauss
+
+# MUST redefine variables AFTER clear
+variable simtime equal step*${dt}
+
+fix 2 type1 ave/time 10 1 10 v_simtime c_msd_type1[1] c_msd_type1[3] file ${MSDFile}
+
+# ---------- MINIMIZATION ----------
+min_style   cg
+minimize    1e-10 1e-10 10000 10000
+
+# ---------- RUN ----------
+velocity    all create ${T} 12345 mom yes rot yes dist gaussian
+timestep    ${dt}
+fix 1 all nvt temp ${T} ${T} 0.1
+
+run ${t_run}
+
+write_restart ${RestartFile}
+
+# ---------- NEXT TEMP ----------
+next TempList
+jump SELF loop_start
+# =====================================
