@@ -91,17 +91,43 @@ class App(tk.Tk):
         super().__init__()
         self.title("LLZO Pipeline")
         self.geometry("1050x720")
+        self.minsize(980, 680)
+        self.configure(bg="#eef3f7")
         self.log_queue = queue.Queue()
         self.proc = None
 
         self.vars = {}
         self.filter_enabled = {}
         self.stage_vars = {}
-        self.dopant_rows = []
+        self.cell_editor = None
 
+        self.configure_styles()
         self._build()
         self.load_existing_or_defaults()
         self.after(200, self.poll_log)
+
+    def configure_styles(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", font=("TkDefaultFont", 10), background="#eef3f7", foreground="#1f2933")
+        style.configure("TNotebook", background="#eef3f7", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(14, 8), background="#dbe7ef", foreground="#243746")
+        style.map("TNotebook.Tab", background=[("selected", "#ffffff")], foreground=[("selected", "#0f2f44")])
+        style.configure("Card.TFrame", background="#ffffff", relief="flat")
+        style.configure("TLabel", background="#ffffff", foreground="#1f2933")
+        style.configure("Hint.TLabel", background="#ffffff", foreground="#5d6b78")
+        style.configure("TButton", padding=(10, 6), background="#d8e7ef", foreground="#143447")
+        style.map("TButton", background=[("active", "#c8dde8")])
+        style.configure("Accent.TButton", padding=(12, 7), background="#3a7ca5", foreground="#ffffff")
+        style.map("Accent.TButton", background=[("active", "#2f6d93")])
+        style.configure("TEntry", fieldbackground="#fbfdff", bordercolor="#b8c8d4", lightcolor="#b8c8d4")
+        style.configure("TSpinbox", fieldbackground="#fbfdff", bordercolor="#b8c8d4")
+        style.configure("Treeview", background="#fbfdff", fieldbackground="#fbfdff", foreground="#1f2933", rowheight=28, bordercolor="#c8d6df")
+        style.configure("Treeview.Heading", background="#d8e7ef", foreground="#143447", padding=(6, 6))
+        style.map("Treeview", background=[("selected", "#cfe3ef")], foreground=[("selected", "#0f2f44")])
 
     def _var(self, name, value=""):
         v = tk.StringVar(value="" if value is None else str(value))
@@ -127,7 +153,7 @@ class App(tk.Tk):
         self.build_bottom()
 
     def build_structure_tab(self):
-        frame = ttk.Frame(self.notebook, padding=12)
+        frame = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
         self.notebook.add(frame, text="Structure")
         ttk.Label(frame, text="Input structure CIF").grid(row=0, column=0, sticky="w")
         ttk.Entry(frame, textvariable=self._var("cif"), width=70).grid(row=0, column=1, sticky="ew", padx=8)
@@ -141,18 +167,18 @@ class App(tk.Tk):
         ttk.Label(
             frame,
             text="Example: CIF = cubic-LLZO.cif, output/run folder = ./pipeline_runs, supercell = 1, 1, 2. The code stays here; run_*, MD_run_*, logs, RDF folders, and summary.txt are saved in the output folder.",
-            foreground="#555",
+            style="Hint.TLabel",
             wraplength=850,
         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(16, 0))
         frame.columnconfigure(1, weight=1)
 
     def build_dopants_tab(self):
-        frame = ttk.Frame(self.notebook, padding=12)
+        frame = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
         self.notebook.add(frame, text="Dopants")
         ttk.Label(
             frame,
-            text="Add one row per substitution. All rows must use the same carrier. Example: Nb, 5, Zr, 4, 1, Li, 1 means replace one Zr4+ with Nb5+ and charge-balance using Li+.",
-            foreground="#555",
+            text="Add one row per substitution. Double-click any table cell to edit it. Complete example row: Nb | 5 | Zr | 4 | 1 | Li | 1.",
+            style="Hint.TLabel",
             wraplength=930,
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 8))
         columns = tuple(spec[0] for spec in DOPANT_COLUMNS)
@@ -161,31 +187,26 @@ class App(tk.Tk):
             self.dopant_tree.heading(col, text=heading)
             self.dopant_tree.column(col, width=width, minwidth=width, anchor="center", stretch=False)
         self.dopant_tree.grid(row=1, column=0, columnspan=7, sticky="nsew")
+        self.dopant_tree.bind("<Double-1>", self.edit_dopant_cell)
+        self.dopant_tree.tag_configure("empty", foreground="#7b8794")
 
-        self.dopant_inputs = {}
-        for i, (col, _heading, _width, entry_width) in enumerate(DOPANT_COLUMNS):
-            v = tk.StringVar()
-            self.dopant_inputs[col] = v
-            ttk.Entry(frame, textvariable=v, width=entry_width).grid(row=2, column=i, padx=3, pady=8)
-        for col, example in zip(columns, ("Nb", "5", "Zr", "4", "1", "Li", "1")):
-            self.dopant_inputs[col].set(example)
-        ttk.Button(frame, text="Add row", command=self.add_dopant_from_inputs).grid(row=3, column=0, sticky="w")
-        ttk.Button(frame, text="Remove row", command=self.remove_dopant).grid(row=3, column=1, sticky="w")
+        ttk.Button(frame, text="Add empty row", command=self.add_empty_dopant_row, style="Accent.TButton").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(frame, text="Remove selected row", command=self.remove_dopant).grid(row=2, column=1, sticky="w", pady=(10, 0))
         ttk.Label(
             frame,
-            text="The boxes above line up with the table columns and are an editable example, not an active dopant. Press Add row to put it into the list.",
-            foreground="#555",
-        ).grid(row=4, column=0, columnspan=7, sticky="w", pady=(8, 0))
+            text="Blank rows are ignored. Partly filled rows are rejected so the saved input cannot silently miss required dopant data.",
+            style="Hint.TLabel",
+        ).grid(row=3, column=0, columnspan=7, sticky="w", pady=(8, 0))
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
     def build_filters_tab(self):
-        frame = ttk.Frame(self.notebook, padding=12)
+        frame = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
         self.notebook.add(frame, text="Distance Filters")
         ttk.Label(
             frame,
             text="Distances are in Angstrom. Enable a field only when you want to reject structures outside that limit. Disabled means no limit.",
-            foreground="#555",
+            style="Hint.TLabel",
             wraplength=860,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         names = ["dop_dop_min", "dop_dop_max", "dop_ion_min", "dop_ion_max", "ion_ion_min", "ion_ion_max"]
@@ -198,11 +219,11 @@ class App(tk.Tk):
         ttk.Label(
             frame,
             text="Example: dop_ion_max = 15 keeps only structures where every dopant-carrier distance is <= 15 Angstrom.",
-            foreground="#555",
+            style="Hint.TLabel",
         ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def build_relax_md_tab(self):
-        frame = ttk.Frame(self.notebook, padding=12)
+        frame = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
         self.notebook.add(frame, text="Relaxation & MD")
         ttk.Label(frame, text="ORB relaxation model").grid(row=0, column=0, sticky="w")
         model_values = [
@@ -225,12 +246,12 @@ class App(tk.Tk):
         ttk.Label(
             frame,
             text="LAMMPS uses metal units: distance Angstrom, time ps, temperature K, energy eV. Example temperatures: 600, 800, 900. Pattern dump*{T}* searches for files such as dump_LLZO_900.lammpstrj.",
-            foreground="#555",
+            style="Hint.TLabel",
             wraplength=860,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
     def build_rdf_tab(self):
-        frame = ttk.Frame(self.notebook, padding=12)
+        frame = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
         self.notebook.add(frame, text="RDF")
         ttk.Checkbutton(frame, text="Run RDF", variable=self._bool("run_rdf")).grid(row=0, column=0, sticky="w")
         ttk.Label(frame, text="RDF temperatures (K)").grid(row=1, column=0, sticky="w", pady=6)
@@ -244,12 +265,12 @@ class App(tk.Tk):
         ttk.Label(
             frame,
             text="RDF temperatures must be selected from the MD temperatures. Each temperature is saved separately, for example MD_run_1/rdf_900K/. Pair format for users is element names: all or Li-Li, Li-O. The pipeline maps elements to LAMMPS type numbers after element_list is generated.",
-            foreground="#555",
+            style="Hint.TLabel",
             wraplength=860,
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
     def build_analysis_tab(self):
-        frame = ttk.Frame(self.notebook, padding=12)
+        frame = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
         self.notebook.add(frame, text="Analysis")
         ttk.Checkbutton(frame, text="MSD Arrhenius", variable=self._bool("run_msd_arrhenius")).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(frame, text="Elastic", variable=self._bool("run_elastic")).grid(row=1, column=0, sticky="w")
@@ -267,29 +288,39 @@ class App(tk.Tk):
         ttk.Label(
             frame,
             text="MSD time is in ps. Diffusivity output is cm^2/s. Conductivity output is S/m.",
-            foreground="#555",
+            style="Hint.TLabel",
         ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
     def build_stages_tab(self):
-        frame = ttk.Frame(self.notebook, padding=12)
+        frame = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
         self.notebook.add(frame, text="Stages")
-        ttk.Label(frame, text="Disable stages only when rerunning part of an existing workflow.", foreground="#555").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(frame, text="Disable stages only when rerunning part of an existing workflow.", style="Hint.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
         for r, name in enumerate(["doping", "energy_comparison", "md", "post_processing", "rdf", "summary"]):
             v = tk.BooleanVar(value=True)
             self.stage_vars[name] = v
             ttk.Checkbutton(frame, text=name, variable=v).grid(row=r + 1, column=0, sticky="w", pady=4)
 
     def build_bottom(self):
-        bar = ttk.Frame(self, padding=(8, 0, 8, 8))
+        bar = ttk.Frame(self, padding=(10, 0, 10, 8))
         bar.pack(fill="x")
         ttk.Button(bar, text="Save input.yaml", command=self.save_yaml).pack(side="left")
-        ttk.Button(bar, text="Run pipeline", command=self.run_pipeline).pack(side="left", padx=8)
+        ttk.Button(bar, text="Run pipeline", command=self.run_pipeline, style="Accent.TButton").pack(side="left", padx=8)
         self.status = ttk.Label(bar, text="Idle")
         self.status.pack(side="left", padx=8)
-        ttk.Label(bar, text="Bottom panel: live pipeline log/output", foreground="#555").pack(side="left", padx=8)
+        ttk.Label(bar, text="Bottom panel: live pipeline log/output", foreground="#5d6b78").pack(side="left", padx=8)
 
-        self.log = tk.Text(self, height=14, wrap="word")
-        self.log.pack(fill="both", expand=False, padx=8, pady=(0, 8))
+        self.log = tk.Text(
+            self,
+            height=14,
+            wrap="word",
+            bg="#101820",
+            fg="#d9e7ee",
+            insertbackground="#d9e7ee",
+            relief="flat",
+            padx=10,
+            pady=8,
+        )
+        self.log.pack(fill="both", expand=False, padx=10, pady=(0, 10))
 
     def pick_cif(self):
         path = filedialog.askopenfilename(initialdir=ROOT, filetypes=[("CIF files", "*.cif"), ("All files", "*")])
@@ -307,14 +338,71 @@ class App(tk.Tk):
             except ValueError:
                 self.vars["output_dir"].set(path)
 
-    def add_dopant_from_inputs(self):
-        values = [self.dopant_inputs[k].get().strip() for k in self.dopant_inputs]
-        if not values[0] or not values[2]:
-            messagebox.showerror("Dopants", "dopant and host are required")
+    def add_empty_dopant_row(self):
+        values = tuple("" for _ in DOPANT_COLUMNS)
+        item = self.dopant_tree.insert("", "end", values=values, tags=("empty",))
+        self.dopant_tree.selection_set(item)
+        self.dopant_tree.focus(item)
+
+    def edit_dopant_cell(self, event):
+        if self.cell_editor is not None:
+            self.cell_editor.destroy()
+            self.cell_editor = None
+
+        item = self.dopant_tree.identify_row(event.y)
+        column_id = self.dopant_tree.identify_column(event.x)
+        if not item or not column_id:
             return
-        self.dopant_tree.insert("", "end", values=values)
+
+        col_index = int(column_id.replace("#", "")) - 1
+        if col_index < 0:
+            return
+
+        bbox = self.dopant_tree.bbox(item, column_id)
+        if not bbox:
+            return
+
+        values = list(self.dopant_tree.item(item, "values"))
+        while len(values) < len(DOPANT_COLUMNS):
+            values.append("")
+
+        x, y, width, height = bbox
+        editor = ttk.Entry(self.dopant_tree)
+        editor.insert(0, values[col_index])
+        editor.select_range(0, "end")
+        editor.place(x=x, y=y, width=width, height=height)
+        editor.focus_set()
+        self.cell_editor = editor
+        finished = {"done": False}
+
+        def commit(_event=None):
+            if finished["done"]:
+                return
+            finished["done"] = True
+            new_values = list(self.dopant_tree.item(item, "values"))
+            while len(new_values) < len(DOPANT_COLUMNS):
+                new_values.append("")
+            new_values[col_index] = editor.get().strip()
+            tags = ("empty",) if not any(str(v).strip() for v in new_values) else ()
+            self.dopant_tree.item(item, values=new_values, tags=tags)
+            editor.destroy()
+            self.cell_editor = None
+
+        def cancel(_event=None):
+            if finished["done"]:
+                return
+            finished["done"] = True
+            editor.destroy()
+            self.cell_editor = None
+
+        editor.bind("<Return>", commit)
+        editor.bind("<FocusOut>", commit)
+        editor.bind("<Escape>", cancel)
 
     def remove_dopant(self):
+        if self.cell_editor is not None:
+            self.cell_editor.destroy()
+            self.cell_editor = None
         for item in self.dopant_tree.selection():
             self.dopant_tree.delete(item)
 
@@ -366,17 +454,32 @@ class App(tk.Tk):
     def collect_config(self):
         dopants = []
         carriers = set()
-        for item in self.dopant_tree.get_children():
-            vals = self.dopant_tree.item(item, "values")
-            d = {
-                "dopant": vals[0],
-                "dopant_valency": int(vals[1]),
-                "host": vals[2],
-                "host_valency": int(vals[3]),
-                "count": int(vals[4]),
-                "carrier": vals[5],
-                "carrier_valency": int(vals[6]),
-            }
+        required_names = [heading for _key, heading, _width, _entry_width in DOPANT_COLUMNS]
+        for row_number, item in enumerate(self.dopant_tree.get_children(), start=1):
+            vals = [str(v).strip() for v in self.dopant_tree.item(item, "values")]
+            vals += [""] * (len(DOPANT_COLUMNS) - len(vals))
+            vals = vals[:len(DOPANT_COLUMNS)]
+
+            if not any(vals):
+                continue
+            if not all(vals):
+                missing = [name for name, value in zip(required_names, vals) if not value]
+                raise ValueError(f"Dopant row {row_number} is incomplete. Missing: {', '.join(missing)}")
+
+            try:
+                d = {
+                    "dopant": vals[0],
+                    "dopant_valency": int(vals[1]),
+                    "host": vals[2],
+                    "host_valency": int(vals[3]),
+                    "count": int(vals[4]),
+                    "carrier": vals[5],
+                    "carrier_valency": int(vals[6]),
+                }
+            except ValueError as exc:
+                raise ValueError(
+                    f"Dopant row {row_number} valency/count fields must be integers"
+                ) from exc
             if d["dopant"] == d["host"]:
                 raise ValueError("dopant and host must be different")
             dopants.append(d)
